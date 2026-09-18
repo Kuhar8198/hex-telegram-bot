@@ -1,0 +1,87 @@
+version: '3.8'
+
+services:
+  # 1. Основной бекенд бота (Python 3.11 / Aiogram 3.x)
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hex_telegram_bot
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - QDRANT_URL=http://qdrant:6333
+      - SEARXNG_URL=http://searxng:8080
+    depends_on:
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      searxng:
+        condition: service_started
+    networks:
+      - nomad_net
+
+  # 2. Локальный автономный поисковик SearXNG
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    restart: always
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./searxng:/etc/searxng
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8080/
+      - SEARXNG_SECRET=${SEARXNG_SECRET:-nomad_searxng_secret_token_default}
+    networks:
+      - nomad_net
+
+  # 3. Векторная БД Qdrant (для семантического RAG)
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    restart: always
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - nomad_net
+
+  # 4. Redis (кэш и FSM Aiogram 3.x)
+  redis:
+    image: redis:alpine
+    container_name: redis
+    restart: always
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - nomad_net
+
+  # 5. Модуль автодеплоя (Протокол "Кочевник")
+  watchtower:
+    image: containrrr/watchtower
+    container_name: watchtower
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --interval 300 --cleanup
+    environment:
+      - WATCHTOWER_POLL_INTERVAL=300
+    networks:
+      - nomad_net
+
+networks:
+  nomad_net:
+    driver: bridge
+
+volumes:
+  qdrant_data:

@@ -1,0 +1,1699 @@
+================================================================================
+HEXAGONAL TELEGRAM BOT — ПОЛНЫЙ СРЕЗ ПРОЕКТА ДЛЯ АУДИТА И РЕВЬЮ
+Дата: 2026-09-18
+Стек: Python 3.11+, Aiogram 3.x, httpx (async), Qdrant, Docker Compose
+Архитектура: Hexagonal Architecture (Ports and Adapters)
+Репозиторий GitHub: https://github.com/Kuhar8198/hex-telegram-bot
+================================================================================
+
+АРХИТЕКТУРНЫЙ ЧЕКЛИСТ И АУДИТ:
+[+] СТРОГАЯ ИЗОЛЯЦИЯ СЛОЕВ:
+    - Domain (models.py): чистые DTO, нет внешних библиотек и I/O.
+    - Ports: только abc.ABC интерфейсы, отсутствие зависимостей от httpx/aiogram/qdrant.
+    - Use Case (process_prompt.py): зависимости передаются строго через DI в __init__.
+    - Adapters: конкретные реализации вынесены во внешние слои inbound/outbound.
+    - Composition Root (main.py): единственная точка связывания зависимостей.
+
+[+] 100% АСИНХРОННОСТЬ:
+    - Все сетевые вызовы выполняются через асинхронный пул httpx.AsyncClient.
+    - Ни одного блокирующего вызова time.sleep() или синхронных библиотек.
+
+[+] ОБРАБОТКА ОШИБОК И ЛИМИТОВ:
+    - Telegram: автоматический чанкинг сообщений до 4000 символов (нет ошибки 'message too long').
+    - Telegram: сырой текст LLM передается с parse_mode=None (нет падений от разметки Markdown).
+    - HF API: перехват 503 (Cold Start) с чтением estimated_time и паузой asyncio.sleep.
+    - HF API: Exponential Backoff (3 попытки с задержкой 2^n сек).
+    - Search: CompositeSearchAdapter (SearXNG с отказоустойчивым переключением на Tavily).
+    - RAG: Семантический поиск и сохранение контекста в векторную БД Qdrant.
+    - Graceful Shutdown: корректное закрытие FSM Storage и bot.session при остановке.
+
+================================================================================
+СТРУКТУРА ФАЙЛОВ
+================================================================================
+app/
+├── domain/models.py
+├── application/
+│   ├── ports/
+│   │   ├── hf_port.py
+│   │   ├── bunker_port.py
+│   │   ├── search_port.py
+│   │   └── vector_port.py
+│   └── use_cases/process_prompt.py
+├── adapters/
+│   ├── inbound/telegram/
+│   │   ├── bot.py
+│   │   └── handlers.py
+│   └── outbound/
+│       ├── hf_adapter.py
+│       ├── bunker_adapter.py
+│       ├── searxng_adapter.py
+│       ├── tavily_adapter.py
+│       ├── composite_search_adapter.py
+│       └── qdrant_adapter.py
+├── config.py
+main.py
+Dockerfile
+docker-compose.yml
+deploy.sh
+requirements.txt
+README.md
+.github/workflows/deploy.yml
+searxng/settings.yml
+
+================================================================================
+ПОЛНЫЙ ИСХОДНЫЙ КОД ВСЕХ МОДУЛЕЙ
+================================================================================
+
+
+================================================================================
+FILE: README.md
+================================================================================
+# 🤖 Hexagonal Telegram AI Bot (Nomad Stack)
+
+Асинхронный Telegram-бот производственного уровня, построенный по принципам **чистой гексагональной архитектуры (Ports and Adapters)** на стеке **Python 3.11+**, **Aiogram 3.x** и **Docker Compose**.
+
+Бот объединяет генеративный искусственный интеллект (Hugging Face Inference API), автономный и внешний веб-поиск (SearXNG + Tavily Fallback), векторную память контекста (Qdrant RAG) и распределенное состояние диалогов (Redis FSM).
+
+---
+
+## 🏛 Архитектура проекта
+
+Проект строго разделен на независимые слои согласно гексагональной архитектуре:
+
+```
+├── app/
+│   ├── domain/                         # Слой Domain (бизнес-модели, DTO, чистый Python без I/O)
+│   │   └── models.py                   # UserPromptDTO, BotResponseDTO, SearchResultDTO
+│   │
+│   ├── application/                    # Слой Application (UseCase и абстрактные порты)
+│   │   ├── ports/                      # Порты (abc.ABC интерфейсы, не знающие о библиотеках)
+│   │   │   ├── hf_port.py              # Порт модели генерации (IHuggingFacePort)
+│   │   │   ├── bunker_port.py          # Порт безопасного хранилища конфигураций (IBunkerPort)
+│   │   │   ├── search_port.py          # Порт поискового движка (ISearchPort)
+│   │   │   └── vector_port.py          # Порт векторной памяти (IVectorStorePort)
+│   │   └── use_cases/                  # Оркестрация бизнес-логики
+│   │       └── process_prompt.py       # Сценарий ProcessPromptUseCase с RAG и веб-поиском
+│   │
+│   ├── adapters/                       # Слой Adapters (реализации портов и интеграции)
+│   │   ├── inbound/telegram/           # Входящий адаптер: Aiogram 3.x
+│   │   │   ├── bot.py                  # Инициализация бота, Dispatcher и RedisStorage
+│   │   │   └── handlers.py             # Роутеры, чанкинг (до 4000 симв.) и безопасная отправка
+│   │   └── outbound/                   # Исходящие адаптеры
+│   │       ├── hf_adapter.py           # HF Inference API с обработкой 503 и Exponential Backoff
+│   │       ├── bunker_adapter.py       # Клиент безопасного хранилища Bunker
+│   │       ├── searxng_adapter.py      # Локальный приватный поиск SearXNG (JSON API)
+│   │       ├── tavily_adapter.py       # Резервный поиск Tavily API
+│   │       ├── composite_search_adapter.py # Fallback-цепочка: SearXNG -> Tavily
+│   │       └── qdrant_adapter.py       # Векторное хранилище Qdrant (семантический RAG)
+│   │
+│   └── config.py                       # Типизированная валидация конфигурации (Pydantic Settings v2)
+│
+├── main.py                             # Composition Root: DI, единый пул HTTP-соединений, запуск и Graceful Shutdown
+├── Dockerfile                          # Легковесный многоэтапный образ Python 3.11 Slim
+├── docker-compose.yml                  # 5 микросервисов: Bot, SearXNG, Qdrant, Redis, Watchtower
+├── searxng/settings.yml                # Конфигурация локального поисковика
+├── deploy.sh                           # Скрипт развертывания
+└── .github/workflows/deploy.yml        # CI/CD: автосборка и публикация в GitHub Packages (GHCR)
+```
+
+---
+
+## ⚡ Ключевые возможности
+
+1. **100% Асинхронность и производительность:**
+   - Никаких блокирующих вызовов (`requests`, `time.sleep`).
+   - Единый пул соединений `httpx.AsyncClient` с контролем `keepalive`, таймаутов и лимитов параллельных коннектов.
+   - Чистый `asyncio` и асинхронные интерфейсы.
+
+2. **Интеллектуальный поиск с Fallback:**
+   - Первичный источник — локальный автономный **SearXNG** без трекинга и ограничений.
+   - Если SearXNG недоступен или выдал пустую выдачу, адаптер автоматически переключается на **Tavily Search API**.
+
+3. **Векторная память (Qdrant RAG):**
+   - Бот ищет семантически похожие предыдущие сообщения и диалоги в Qdrant.
+   - Контекст подмешивается в промпт модели, а итоговый ответ асинхронно сохраняется в векторную коллекцию.
+
+4. **Защита от холодного старта HF:**
+   - Hugging Face часто возвращает `503 Service Unavailable` при развертывании тяжелых моделей. Адаптер парсит поле `estimated_time`, выжидает паузу и повторяет запрос с экспоненциальным бэкоффом.
+
+5. **Безопасная доставка в Telegram:**
+   - Длинные ответы модели разбиваются функцией умного чанкинга на фрагменты до 4000 символов без разрыва слов.
+   - Сырой текст от LLM отправляется безопасно без падений парсера спецсимволов.
+
+6. **Корректный Graceful Shutdown:**
+   - При получении `SIGINT` / `SIGTERM` бот аккуратно завершает polling, закрывает сессию `bot.session` и хранилище `dp.storage` (Redis).
+
+---
+
+## 🚀 Быстрый старт через Docker Compose
+
+### 1. Клонирование и подготовка окружения
+```bash
+git clone https://github.com/Kuhar8198/hex-telegram-bot.git
+cd hex-telegram-bot
+cp .env.example .env
+```
+
+### 2. Заполнение переменных в `.env`
+Откройте файл `.env` и укажите ваши ключи:
+```env
+# Обязательные ключи
+BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrSTUvwxYZ        # от @BotFather
+HF_API_KEY=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx       # токен с huggingface.co
+
+# Опционально: резервный поиск Tavily
+TAVILY_API_KEY=tvly-xxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# Настройки сервисов Docker (по умолчанию уже настроены на локальные контейнеры)
+REDIS_URL=redis://redis:6379/0
+QDRANT_URL=http://qdrant:6333
+SEARXNG_URL=http://searxng:8080
+BUNKER_API_URL=http://localhost:8088
+LOG_LEVEL=INFO
+```
+
+### 3. Запуск всего стека
+Запуск выполняется одной командой:
+```bash
+docker compose up -d --build
+```
+
+Или с помощью скрипта:
+```bash
+chmod +x deploy.sh
+./deploy.sh
+```
+
+### 4. Проверка работы
+```bash
+docker compose ps
+docker compose logs -f bot
+```
+
+---
+
+## 🛠 Запуск в режиме локальной разработки (без Docker)
+
+Если вы хотите запустить только бота локально:
+
+```bash
+# 1. Создание виртуального окружения
+python3 -m venv .venv
+source .venv/bin/activate  # На Windows: .venv\Scripts\activate
+
+# 2. Установка зависимостей
+pip install -r requirements.txt
+
+# 3. Запуск зависимостей (Redis, Qdrant, SearXNG) в Docker
+docker compose up -d redis qdrant searxng
+
+# 4. Запуск приложения (Composition Root)
+python main.py
+```
+
+---
+
+## 🔄 Автодеплой «Кочевник» (Watchtower + GHCR)
+
+В состав `docker-compose.yml` входит контейнер **Watchtower**, который опрашивает GitHub Container Registry (`ghcr.io/kuhar8198/hex-telegram-bot/bot:latest`) каждые 5 минут.
+
+При пуше в ветку `main` запускается GitHub Actions пайплайн (`.github/workflows/deploy.yml`):
+1. Собирает оптимизированный Docker-образ бота.
+2. Публикует его в GHCR.
+3. Сервер с Watchtower автоматически скачивает свежий образ и перезапускает контейнер с сохранением персистентных данных в volumes (`qdrant_data`).
+
+---
+
+## 🛡 Безопасность
+
+- Никакие приватные токены и пароли не зашиты в коде или Git-истории.
+- Все конфигурационные параметры валидируются строгими Pydantic-схемами.
+- Секретный ключ SearXNG передается через переменную среды `SEARXNG_SECRET`.
+- Исключена утечка данных при сбоях сетевых вызовов благодаря строгому логированию ошибок.
+
+
+================================================================================
+FILE: requirements.txt
+================================================================================
+aiogram>=3.17.0
+pydantic>=2.10.0
+pydantic-settings>=2.7.0
+httpx>=0.28.1
+redis>=5.2.1
+qdrant-client>=1.13.0
+
+
+================================================================================
+FILE: .env.example
+================================================================================
+# Telegram Bot Token (от @BotFather)
+BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrSTUvwxYZ
+
+# Hugging Face Inference API
+HF_API_KEY=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+HF_DEFAULT_MODEL=mistralai/Mistral-7B-Instruct-v0.3
+
+# Bunker API (хранилище секретов)
+BUNKER_API_URL=http://localhost:8088
+BUNKER_TOKEN=your_bunker_auth_token_here
+
+# Поисковый сервис (SearXNG / Tavily)
+SEARXNG_URL=http://searxng:8080
+TAVILY_API_KEY=
+
+# Базы данных и кэш
+REDIS_URL=redis://redis:6379/0
+QDRANT_URL=http://qdrant:6333
+
+# Уровень логирования (DEBUG, INFO, WARNING, ERROR)
+LOG_LEVEL=INFO
+
+
+================================================================================
+FILE: Dockerfile
+================================================================================
+# Multi-stage production build for Hexagonal Telegram Bot
+
+# Stage 1: Builder
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --user -r requirements.txt
+
+# Stage 2: Final Runtime Image
+FROM python:3.11-slim AS runner
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH=/home/botuser/.local/bin:$PATH \
+    PYTHONPATH=/app
+
+# Безопасный non-root пользователь
+RUN useradd -m -u 1000 botuser && \
+    mkdir -p /app && \
+    chown -R botuser:botuser /app
+
+COPY --from=builder /root/.local /home/botuser/.local
+COPY --chown=botuser:botuser . /app
+
+USER botuser
+
+CMD ["python", "main.py"]
+
+
+================================================================================
+FILE: docker-compose.yml
+================================================================================
+version: '3.8'
+
+services:
+  # 1. Основной бекенд бота (Python 3.11 / Aiogram 3.x)
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hex_telegram_bot
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - QDRANT_URL=http://qdrant:6333
+      - SEARXNG_URL=http://searxng:8080
+    depends_on:
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      searxng:
+        condition: service_started
+    networks:
+      - nomad_net
+
+  # 2. Локальный автономный поисковик SearXNG
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    restart: always
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./searxng:/etc/searxng
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8080/
+      - SEARXNG_SECRET=${SEARXNG_SECRET:-nomad_searxng_secret_token_default}
+    networks:
+      - nomad_net
+
+  # 3. Векторная БД Qdrant (для семантического RAG)
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    restart: always
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - nomad_net
+
+  # 4. Redis (кэш и FSM Aiogram 3.x)
+  redis:
+    image: redis:alpine
+    container_name: redis
+    restart: always
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - nomad_net
+
+  # 5. Модуль автодеплоя (Протокол "Кочевник")
+  watchtower:
+    image: containrrr/watchtower
+    container_name: watchtower
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --interval 300 --cleanup
+    environment:
+      - WATCHTOWER_POLL_INTERVAL=300
+    networks:
+      - nomad_net
+
+networks:
+  nomad_net:
+    driver: bridge
+
+volumes:
+  qdrant_data:
+
+
+================================================================================
+FILE: deploy.sh
+================================================================================
+#!/usr/bin/env bash
+set -e
+
+echo "=== [NOMAD PROTOCOL] Развертывание Hexagonal Telegram Bot ==="
+
+if [ ! -f ".env" ]; then
+    echo "Создание .env из шаблона .env.example..."
+    cp .env.example .env
+    echo "⚠️ Заполните .env валидным BOT_TOKEN и HF_API_KEY перед запуском!"
+    exit 1
+fi
+
+echo "Сборка и запуск контейнеров через docker compose..."
+docker compose pull || true
+docker compose up -d --build
+
+echo "Проверка запущенных сервисов..."
+docker compose ps
+
+echo "Бот и сопутствующие сервисы успешно запущены!"
+
+
+================================================================================
+FILE: searxng/settings.yml
+================================================================================
+# SearXNG configuration with JSON API enabled
+use_default_settings: true
+
+general:
+  debug: false
+  instance_name: "HexBot SearXNG"
+
+server:
+  port: 8080
+  bind_address: "0.0.0.0"
+  limiter: false
+  image_proxy: false
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "auto"
+  formats:
+    - html
+    - json
+
+engines:
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    disabled: false
+
+  - name: google
+    engine: google
+    shortcut: g
+    disabled: false
+
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: wp
+    disabled: false
+
+
+================================================================================
+FILE: .github/workflows/deploy.yml
+================================================================================
+name: Nomad Auto-Build & Deploy
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GH_PAT_TOKEN }}
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ghcr.io/${{ github.repository }}/bot:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+
+================================================================================
+FILE: app/domain/models.py
+================================================================================
+"""Доменные сущности и DTO.
+
+Слой: Domain
+Не содержит внешних зависимостей или фреймворков.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any
+
+
+@dataclass(frozen=True, slots=True)
+class UserPromptDTO:
+    """DTO запроса пользователя из Telegram."""
+
+    user_id: int
+    chat_id: int
+    prompt: str
+    username: str | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass(frozen=True, slots=True)
+class SearchResultDTO:
+    """DTO результата поиска."""
+
+    title: str
+    url: str
+    snippet: str
+    engine: str = "searxng"
+
+
+@dataclass(frozen=True, slots=True)
+class BotResponseDTO:
+    """DTO сгенерированного ответа."""
+
+    text: str
+    model_used: str | None = None
+    execution_time_ms: float = 0.0
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+================================================================================
+FILE: app/config.py
+================================================================================
+"""Конфигурация приложения на базе pydantic-settings.
+
+Строгая валидация переменных окружения.
+"""
+
+from __future__ import annotations
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """Глобальные настройки и переменные окружения."""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    # Telegram
+    BOT_TOKEN: str = Field(..., description="Токен Telegram бота от @BotFather")
+
+    # Hugging Face
+    HF_API_KEY: str = Field(default="", description="API токен Hugging Face")
+    HF_DEFAULT_MODEL: str = Field(
+        default="mistralai/Mistral-7B-Instruct-v0.3",
+        description="Идентификатор модели HF по умолчанию",
+    )
+
+    # Bunker API
+    BUNKER_API_URL: str = Field(
+        default="http://localhost:8088",
+        description="Базовый URL Bunker API для получения секретов",
+    )
+    BUNKER_TOKEN: str = Field(default="", description="Сервисный токен Bunker")
+
+    # Search (SearXNG / Tavily)
+    SEARXNG_URL: str = Field(
+        default="http://searxng:8080",
+        description="URL локального экземпляра SearXNG",
+    )
+    TAVILY_API_KEY: str = Field(default="", description="Опциональный ключ Tavily API")
+
+    # Хранилища
+    REDIS_URL: str = Field(
+        default="redis://redis:6379/0",
+        description="URL подключения к Redis (кэш и FSM)",
+    )
+    QDRANT_URL: str = Field(
+        default="http://qdrant:6333",
+        description="URL векторной БД Qdrant",
+    )
+
+    # Логирование
+    LOG_LEVEL: str = Field(default="INFO", description="Уровень логирования")
+
+
+settings = Settings()
+
+
+================================================================================
+FILE: app/application/ports/hf_port.py
+================================================================================
+from abc import ABC, abstractmethod
+
+
+class IHuggingFacePort(ABC):
+    """Абстрактный порт взаимодействия с Hugging Face Inference API."""
+
+    @abstractmethod
+    async def generate_response(self, prompt: str, model_id: str | None = None) -> str:
+        """Асинхронная генерация ответа модели по промпту.
+
+        Args:
+            prompt: Входной текстовый промпт для модели.
+            model_id: Опциональный идентификатор модели в реестре HF.
+
+        Returns:
+            str: Сгенерированный текстовый ответ.
+        """
+        pass
+
+
+================================================================================
+FILE: app/application/ports/bunker_port.py
+================================================================================
+from abc import ABC, abstractmethod
+from typing import Any
+
+
+class IBunkerPort(ABC):
+    """Абстрактный порт взаимодействия с хранилищем секретов и конфигураций Bunker."""
+
+    @abstractmethod
+    async def get_config_or_secret(self, key: str) -> dict[str, Any]:
+        """Получение конфигурационного словаря или секрета по ключу.
+
+        Args:
+            key: Идентификатор ключа или секции конфигурации.
+
+        Returns:
+            dict[str, Any]: Словарь с параметрами конфигурации или секретами.
+        """
+        pass
+
+
+================================================================================
+FILE: app/application/ports/search_port.py
+================================================================================
+from abc import ABC, abstractmethod
+from typing import Any
+
+
+class ISearchPort(ABC):
+    """Абстрактный порт взаимодействия с поисковыми движками (SearXNG / Tavily)."""
+
+    @abstractmethod
+    async def search(self, query: str) -> list[dict[str, Any]]:
+        """Асинхронный поиск релевантного контекста в веб-источниках.
+
+        Args:
+            query: Поисковый запрос.
+
+        Returns:
+            list[dict[str, Any]]: Список найденных результатов со сниппетами и метаданными.
+        """
+        pass
+
+
+================================================================================
+FILE: app/application/ports/vector_port.py
+================================================================================
+from abc import ABC, abstractmethod
+from typing import Any
+
+
+class IVectorStorePort(ABC):
+    """Абстрактный порт взаимодействия с векторным хранилищем (Qdrant)."""
+
+    @abstractmethod
+    async def search_similar(self, query: str, limit: int = 3) -> list[dict[str, Any]]:
+        """Асинхронный семантический поиск релевантных фрагментов по запросу.
+
+        Args:
+            query: Текстовый запрос для поиска.
+            limit: Максимальное количество фрагментов.
+
+        Returns:
+            list[dict[str, Any]]: Список найденных фрагментов с метаданными.
+        """
+        pass
+
+    @abstractmethod
+    async def save_context(self, text: str, metadata: dict[str, Any] | None = None) -> bool:
+        """Сохранение текстового фрагмента и метаданных в векторное хранилище.
+
+        Args:
+            text: Текст для сохранения.
+            metadata: Опциональные метаданные (user_id, chat_id, timestamp).
+
+        Returns:
+            bool: Успешность операции.
+        """
+        pass
+
+
+================================================================================
+FILE: app/application/use_cases/process_prompt.py
+================================================================================
+"""Use Case для оркестрации обработки пользовательского промпта.
+
+Слой: Application (Use Cases)
+Архитектурный паттерн: Hexagonal Architecture (Ports and Adapters)
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from app.application.ports.bunker_port import IBunkerPort
+from app.application.ports.hf_port import IHuggingFacePort
+from app.application.ports.search_port import ISearchPort
+from app.application.ports.vector_port import IVectorStorePort
+
+logger = logging.getLogger(__name__)
+
+
+class UseCaseError(Exception):
+    """Базовое исключение для слоя Application Use Cases."""
+    pass
+
+
+class ProcessPromptUseCaseError(UseCaseError):
+    """Исключение, возникающее при ошибках исполнения пайплайна обработки промпта."""
+    pass
+
+
+class ProcessPromptUseCase:
+    """Use Case для обработки запроса пользователя.
+
+    Координирует работу внешних портов:
+    - Запрашивает конфигурацию и секреты из Bunker API;
+    - При наличии ISearchPort обогащает промпт внешним веб-контекстом;
+    - При наличии IVectorStorePort подтягивает семантический контекст из Qdrant;
+    - Вызывает Hugging Face Inference API для генерации итогового ответа;
+    - Асинхронно сохраняет контекст диалога в векторное хранилище.
+    """
+
+    def __init__(
+        self,
+        hf_port: IHuggingFacePort,
+        bunker_port: IBunkerPort,
+        search_port: ISearchPort | None = None,
+        vector_port: IVectorStorePort | None = None,
+    ) -> None:
+        """Инициализация Use Case через внедрение абстрактных портов (Dependency Injection).
+
+        Args:
+            hf_port: Абстрактный порт взаимодействия с моделью генерации (Hugging Face).
+            bunker_port: Абстрактный порт взаимодействия с защищенным хранилищем Bunker.
+            search_port: Опциональный абстрактный порт веб-поиска (SearXNG / Tavily).
+            vector_port: Опциональный абстрактный порт векторной БД (Qdrant).
+        """
+        self._hf_port: IHuggingFacePort = hf_port
+        self._bunker_port: IBunkerPort = bunker_port
+        self._search_port: ISearchPort | None = search_port
+        self._vector_port: IVectorStorePort | None = vector_port
+
+    async def execute(self, prompt: str, model_id: str | None = None) -> str:
+        """Выполняет полный цикл обработки промпта.
+
+        Args:
+            prompt: Текстовый запрос пользователя.
+            model_id: Идентификатор целевой модели.
+
+        Returns:
+            str: Сгенерированный текстовый ответ.
+
+        Raises:
+            ProcessPromptUseCaseError: При критических сбоях вызовов внешних сервисов.
+        """
+        clean_prompt: str = prompt.strip()
+        if not clean_prompt:
+            logger.warning("Получен пустой промпт для обработки.")
+            return "Запрос не может быть пустым. Пожалуйста, введите текст."
+
+        logger.info(
+            "Начало выполнения ProcessPromptUseCase (длина промпта: %d симв., переданный model_id: %s)",
+            len(clean_prompt),
+            model_id,
+        )
+
+        # 1. Запрос конфигурации и параметров из Bunker API
+        bunker_config: dict[str, Any] = await self._fetch_bunker_config("llm_settings")
+
+        target_model_id: str | None = (
+            model_id
+            or bunker_config.get("default_model_id")
+            or bunker_config.get("model_id")
+        )
+
+        # 2. Обогащение контекстом веб-поиска (SearXNG / Tavily fallback)
+        search_context: str = ""
+        if self._search_port is not None:
+            search_context = await self._retrieve_search_context(clean_prompt)
+
+        # 3. Обогащение семантическим контекстом из векторной БД (Qdrant)
+        vector_context: str = ""
+        if self._vector_port is not None:
+            vector_context = await self._retrieve_vector_context(clean_prompt)
+
+        # 4. Сборка итогового промпта
+        final_prompt: str = self._compose_prompt(
+            user_prompt=clean_prompt,
+            search_context=search_context,
+            vector_context=vector_context,
+            system_instruction=bunker_config.get("system_prompt"),
+        )
+
+        # 5. Асинхронная генерация ответа через порт Hugging Face
+        response = await self._generate_llm_response(
+            prompt=final_prompt,
+            model_id=target_model_id,
+        )
+
+        # 6. Фоновое сохранение истории в векторное хранилище
+        if self._vector_port is not None:
+            try:
+                await self._vector_port.save_context(
+                    text=f"Q: {clean_prompt}\nA: {response}",
+                    metadata={"model": target_model_id},
+                )
+            except Exception as exc:
+                logger.warning("Не удалось фоново сохранить контекст в векторный стор: %s", exc)
+
+        return response
+
+    async def _fetch_bunker_config(self, key: str) -> dict[str, Any]:
+        """Безопасное получение конфигурации из порта Bunker."""
+        try:
+            logger.debug("Запрос конфигурации '%s' из BunkerPort", key)
+            config = await self._bunker_port.get_config_or_secret(key)
+            return config if isinstance(config, dict) else {}
+        except Exception as exc:
+            logger.error("Критический сбой при обращении к Bunker API (key=%s): %s", key, exc, exc_info=True)
+            raise ProcessPromptUseCaseError(f"Ошибка получения конфигурации из Bunker: {exc}") from exc
+
+    async def _retrieve_search_context(self, query: str) -> str:
+        """Поиск дополнительного веб-контекста с отказоустойчивой обработкой."""
+        if self._search_port is None:
+            return ""
+
+        try:
+            results = await self._search_port.search(query)
+            if not results:
+                return ""
+
+            formatted_snippets: list[str] = []
+            for idx, item in enumerate(results[:5], start=1):
+                title = str(item.get("title", "Без заголовка")).strip()
+                content = str(item.get("content") or item.get("snippet") or "").strip()
+                url = str(item.get("url", "")).strip()
+
+                if content:
+                    snippet = f"[{idx}] {title}\nИсточник: {url}\nИнформация: {content}"
+                    formatted_snippets.append(snippet)
+
+            return "\n\n".join(formatted_snippets)
+        except Exception as exc:
+            logger.warning("Ошибка поиска веб-контекста: %s. Генерация продолжается.", exc)
+            return ""
+
+    async def _retrieve_vector_context(self, query: str) -> str:
+        """Поиск семантического контекста из векторной БД."""
+        if self._vector_port is None:
+            return ""
+
+        try:
+            results = await self._vector_port.search_similar(query, limit=3)
+            if not results:
+                return ""
+
+            chunks = [item["text"] for item in results if "text" in item]
+            return "\n---\n".join(chunks)
+        except Exception as exc:
+            logger.warning("Ошибка получения векторного контекста: %s. Пропуск.", exc)
+            return ""
+
+    def _compose_prompt(
+        self,
+        user_prompt: str,
+        search_context: str,
+        vector_context: str = "",
+        system_instruction: str | None = None,
+    ) -> str:
+        """Формирует итоговую структуру промпта с секционированием."""
+        parts: list[str] = []
+
+        if system_instruction and system_instruction.strip():
+            parts.append(f"### СИСТЕМНЫЕ ИНСТРУКЦИИ:\n{system_instruction.strip()}")
+
+        if vector_context and vector_context.strip():
+            parts.append(
+                f"### ПРЕДЫДУЩИЙ РЕЛЕВАНТНЫЙ КОНТЕКСТ (RAG):\n"
+                f"{vector_context.strip()}"
+            )
+
+        if search_context and search_context.strip():
+            parts.append(
+                f"### АКТУАЛЬНЫЙ ВЕБ-КОНТЕКСТ ДЛЯ СПРАВКИ:\n"
+                f"{search_context.strip()}\n\n"
+                f"Используй данный контекст при ответе, если он релевантен."
+            )
+
+        parts.append(f"### ЗАПРОС ПОЛЬЗОВАТЕЛЯ:\n{user_prompt}")
+
+        return "\n\n".join(parts)
+
+    async def _generate_llm_response(self, prompt: str, model_id: str | None) -> str:
+        """Вызов порта инференса Hugging Face."""
+        try:
+            response: str = await self._hf_port.generate_response(
+                prompt=prompt,
+                model_id=model_id,
+            )
+            return response if response else "Модель вернула пустой ответ. Попробуйте переформулировать запрос."
+        except Exception as exc:
+            logger.error("Критический сбой генерации в HuggingFacePort: %s", exc, exc_info=True)
+            raise ProcessPromptUseCaseError(f"Ошибка генерации ответа в Hugging Face: {exc}") from exc
+
+
+================================================================================
+FILE: app/adapters/inbound/telegram/bot.py
+================================================================================
+"""Инициализация Telegram бота и диспетчера.
+
+Слой: Adapters (Inbound)
+"""
+
+from __future__ import annotations
+
+import logging
+
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.fsm.storage.base import BaseStorage
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.redis import RedisStorage
+
+from app.adapters.inbound.telegram.handlers import router
+from app.application.use_cases.process_prompt import ProcessPromptUseCase
+
+logger = logging.getLogger(__name__)
+
+
+def create_bot_and_dispatcher(
+    bot_token: str,
+    process_prompt_use_case: ProcessPromptUseCase,
+    redis_url: str | None = None,
+) -> tuple[Bot, Dispatcher]:
+    """Фабрика для создания бота и диспетчера с внедрением Use Case."""
+    bot = Bot(
+        token=bot_token,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+
+    # Инициализация FSM-хранилища
+    storage: BaseStorage
+    if redis_url:
+        try:
+            storage = RedisStorage.from_url(redis_url)
+            logger.info("Подключено FSM хранилище Redis: %s", redis_url)
+        except Exception as exc:
+            logger.warning("Не удалось подключить RedisStorage: %s. Используется MemoryStorage.", exc)
+            storage = MemoryStorage()
+    else:
+        storage = MemoryStorage()
+
+    dp = Dispatcher(storage=storage)
+
+    # Внедрение зависимостей в контекст Aiogram
+    dp["use_case"] = process_prompt_use_case
+    dp.include_router(router)
+
+    return bot, dp
+
+
+================================================================================
+FILE: app/adapters/inbound/telegram/handlers.py
+================================================================================
+"""Обработчики сообщений Telegram (Aiogram 3.x).
+
+Слой: Adapters (Inbound)
+Особенности:
+- Защита от превышения лимита Telegram (4096 символов) через разбиение на фрагменты (chunking).
+- Безопасная отправка сырого текста модели без риска падения парсера Markdown/HTML.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from aiogram import Router, types
+from aiogram.filters import Command, CommandStart
+
+from app.application.use_cases.process_prompt import ProcessPromptUseCase, ProcessPromptUseCaseError
+from app.domain.models import UserPromptDTO
+
+logger = logging.getLogger(__name__)
+
+router = Router(name="main_router")
+
+TELEGRAM_MAX_MESSAGE_LENGTH = 4000  # Безопасный порог с запасом под лимит 4096
+
+
+def split_text_into_chunks(text: str, max_chunk_size: int = TELEGRAM_MAX_MESSAGE_LENGTH) -> list[str]:
+    """Разбивает длинный текст на фрагменты без разрыва слов по возможности."""
+    if len(text) <= max_chunk_size:
+        return [text]
+
+    chunks: list[str] = []
+    current_text = text
+
+    while current_text:
+        if len(current_text) <= max_chunk_size:
+            chunks.append(current_text)
+            break
+
+        # Ищем ближайший перенос строки или пробел
+        split_index = current_text.rfind("\n", 0, max_chunk_size)
+        if split_index == -1 or split_index < max_chunk_size // 2:
+            split_index = current_text.rfind(" ", 0, max_chunk_size)
+        if split_index == -1:
+            split_index = max_chunk_size
+
+        chunk = current_text[:split_index].strip()
+        if chunk:
+            chunks.append(chunk)
+        current_text = current_text[split_index:].strip()
+
+    return chunks
+
+
+@router.message(CommandStart())
+async def cmd_start(message: types.Message) -> None:
+    """Обработка команды /start."""
+    welcome_text = (
+        "👋 Привет! Я асинхронный ИИ-ассистент на базе гексагональной архитектуры.\n\n"
+        "Отправьте мне любой запрос или вопрос — я выполню поиск через SearXNG/Tavily, "
+        "извлеку векторный контекст и сгенерирую ответ через модель инференса."
+    )
+    await message.answer(welcome_text)
+
+
+@router.message(Command("help"))
+async def cmd_help(message: types.Message) -> None:
+    """Обработка команды /help."""
+    help_text = (
+        "⚙️ Доступные команды:\n"
+        "/start — Перезапуск бота и приветствие\n"
+        "/help — Справка\n\n"
+        "Просто напишите сообщение, и бот сформирует структурированный ответ с учетом веб-поиска."
+    )
+    await message.answer(help_text)
+
+
+@router.message()
+async def handle_prompt(
+    message: types.Message,
+    use_case: ProcessPromptUseCase,
+) -> None:
+    """Обработчик входящего текста.
+
+    Преобразует событие в UserPromptDTO, делегирует задачу в ProcessPromptUseCase,
+    разбивает ответ на чанки (при превышении 4096 символов) и безопасно отправляет пользователю.
+    """
+    if not message.text or not message.from_user:
+        return
+
+    # Конвертация входящего события в чистый DTO
+    dto = UserPromptDTO(
+        user_id=message.from_user.id,
+        chat_id=message.chat.id,
+        prompt=message.text,
+        username=message.from_user.username,
+    )
+
+    logger.info("Получен запрос от user_id=%s: %.40s...", dto.user_id, dto.prompt)
+
+    # Индикация набора текста
+    await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
+
+    try:
+        response_text = await use_case.execute(prompt=dto.prompt)
+        chunks = split_text_into_chunks(response_text)
+
+        for chunk in chunks:
+            # Отправка без явного parse_mode, чтобы символы разметки от LLM не ломали отправку
+            await message.reply(chunk, parse_mode=None)
+
+    except ProcessPromptUseCaseError as exc:
+        logger.error("Ошибка бизнес-логики: %s", exc)
+        await message.reply("⚠️ Произошла ошибка при обработке запроса. Пожалуйста, попробуйте позже.", parse_mode=None)
+    except Exception as exc:
+        logger.error("Непредвиденный сбой хендлера: %s", exc, exc_info=True)
+        await message.reply("❌ Внутренняя ошибка сервиса.", parse_mode=None)
+
+
+================================================================================
+FILE: app/adapters/outbound/hf_adapter.py
+================================================================================
+"""Адаптер для Hugging Face Inference API с поддержкой Cold-Start Retry и Exponential Backoff.
+
+Слой: Adapters (Outbound)
+Имплементирует: IHuggingFacePort
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Any
+
+import httpx
+
+from app.application.ports.hf_port import IHuggingFacePort
+
+logger = logging.getLogger(__name__)
+
+
+class HfAdapter(IHuggingFacePort):
+    """Асинхронный адаптер Hugging Face Inference API с обработкой 503 Service Unavailable."""
+
+    def __init__(
+        self,
+        api_key: str,
+        default_model: str = "mistralai/Mistral-7B-Instruct-v0.3",
+        http_client: httpx.AsyncClient | None = None,
+        max_retries: int = 3,
+    ) -> None:
+        self._api_key: str = api_key
+        self._default_model: str = default_model
+        self._client: httpx.AsyncClient = http_client or httpx.AsyncClient(timeout=60.0)
+        self._max_retries: int = max_retries
+
+    async def generate_response(self, prompt: str, model_id: str | None = None) -> str:
+        """Отправляет промпт в HF Inference API с обработкой 'холодного старта'."""
+        target_model = model_id or self._default_model
+        endpoint = f"https://api-inference.huggingface.co/models/{target_model}"
+
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+        payload: dict[str, Any] = {
+            "inputs": prompt,
+            "parameters": {
+                "max_new_tokens": 1024,
+                "temperature": 0.7,
+                "return_full_text": False,
+            },
+        }
+
+        logger.debug("Отправка запроса к HF API: model=%s", target_model)
+
+        for attempt in range(1, self._max_retries + 1):
+            try:
+                response = await self._client.post(endpoint, headers=headers, json=payload)
+
+                # Обработка 503 (Модель загружается в память)
+                if response.status_code == 503:
+                    data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+                    estimated_time = float(data.get("estimated_time", 20.0))
+                    # Ограничиваем паузу максимум 30 секундами за одну итерацию
+                    sleep_time = min(estimated_time, 30.0)
+                    logger.warning(
+                        "HF модель '%s' загружается (503 Service Unavailable). Повтор через %.1f сек (попытка %d/%d)...",
+                        target_model,
+                        sleep_time,
+                        attempt,
+                        self._max_retries,
+                    )
+                    await asyncio.sleep(sleep_time)
+                    continue
+
+                response.raise_for_status()
+                data = response.json()
+
+                if isinstance(data, list) and len(data) > 0 and "generated_text" in data[0]:
+                    return str(data[0]["generated_text"]).strip()
+                if isinstance(data, dict) and "generated_text" in data:
+                    return str(data["generated_text"]).strip()
+
+                return str(data)
+
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 503 and attempt < self._max_retries:
+                    await asyncio.sleep(2.0 ** attempt)
+                    continue
+                logger.error("HTTP ошибка HF API [%s]: %s", exc.response.status_code, exc.response.text)
+                raise RuntimeError(f"HuggingFace API HTTP Error: {exc.response.status_code}") from exc
+            except (httpx.ConnectError, httpx.ReadTimeout) as exc:
+                if attempt < self._max_retries:
+                    backoff = 2.0 ** attempt
+                    logger.warning("Сетевой сбой при обращении к HF (%s). Повтор через %.1f сек...", exc, backoff)
+                    await asyncio.sleep(backoff)
+                    continue
+                raise RuntimeError(f"HuggingFace API timeout/network failure after {self._max_retries} attempts: {exc}") from exc
+            except Exception as exc:
+                logger.error("Непредвиденный сбой HF API: %s", exc, exc_info=True)
+                raise RuntimeError(f"HuggingFace API failure: {exc}") from exc
+
+        raise RuntimeError(f"HuggingFace API: превышено максимальное число повторных попыток ({self._max_retries}).")
+
+
+================================================================================
+FILE: app/adapters/outbound/bunker_adapter.py
+================================================================================
+"""Адаптер для взаимодействия с Bunker API (хранилище секретов и конфигурации).
+
+Слой: Adapters (Outbound)
+Имплементирует: IBunkerPort
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+import httpx
+
+from app.application.ports.bunker_port import IBunkerPort
+
+logger = logging.getLogger(__name__)
+
+
+class BunkerAdapter(IBunkerPort):
+    """Асинхронный адаптер сервиса Bunker."""
+
+    def __init__(
+        self,
+        base_url: str,
+        token: str = "",
+        http_client: httpx.AsyncClient | None = None,
+    ) -> None:
+        self._base_url: str = base_url.rstrip("/")
+        self._token: str = token
+        self._client: httpx.AsyncClient = http_client or httpx.AsyncClient(timeout=15.0)
+
+    async def get_config_or_secret(self, key: str) -> dict[str, Any]:
+        """Получает параметры конфигурации или секреты по ключу."""
+        endpoint = f"{self._base_url}/api/v1/secrets/{key}"
+        headers: dict[str, str] = {
+            "Accept": "application/json",
+        }
+        if self._token:
+            headers["Authorization"] = f"Bearer {self._token}"
+
+        try:
+            logger.debug("Запрос к Bunker API: endpoint=%s", endpoint)
+            response = await self._client.get(endpoint, headers=headers)
+            if response.status_code == 404:
+                logger.warning("Ключ '%s' не найден в Bunker. Возврат пустой конфигурации.", key)
+                return {}
+            response.raise_for_status()
+            data = response.json()
+            return data if isinstance(data, dict) else {"value": data}
+        except httpx.ConnectError:
+            logger.warning("Bunker недоступен по адресу %s. Возврат резервного значения.", self._base_url)
+            return {}
+        except Exception as exc:
+            logger.warning("Ошибка при чтении из Bunker (%s): %s. Используются дефолтные параметры.", key, exc)
+            return {}
+
+
+================================================================================
+FILE: app/adapters/outbound/searxng_adapter.py
+================================================================================
+"""Адаптер локального метапоисковика SearXNG.
+
+Слой: Adapters (Outbound)
+Имплементирует: ISearchPort
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+import httpx
+
+from app.application.ports.search_port import ISearchPort
+
+logger = logging.getLogger(__name__)
+
+
+class SearxngAdapter(ISearchPort):
+    """Асинхронный адаптер поиска SearXNG."""
+
+    def __init__(
+        self,
+        base_url: str = "http://searxng:8080",
+        http_client: httpx.AsyncClient | None = None,
+    ) -> None:
+        self._base_url: str = base_url.rstrip("/")
+        self._client: httpx.AsyncClient = http_client or httpx.AsyncClient(timeout=10.0)
+
+    async def search(self, query: str) -> list[dict[str, Any]]:
+        """Выполняет веб-поиск через SearXNG JSON API."""
+        endpoint = f"{self._base_url}/search"
+        params: dict[str, Any] = {
+            "q": query,
+            "format": "json",
+            "language": "auto",
+        }
+
+        try:
+            logger.debug("Запрос в SearXNG: query=%.40s...", query)
+            response = await self._client.get(endpoint, params=params)
+            response.raise_for_status()
+            data = response.json()
+            results = data.get("results", [])
+
+            return [
+                {
+                    "title": item.get("title", ""),
+                    "url": item.get("url", ""),
+                    "content": item.get("content", ""),
+                }
+                for item in results
+                if isinstance(item, dict)
+            ]
+        except Exception as exc:
+            logger.warning("Сбой при выполнении поиска в SearXNG: %s", exc)
+            return []
+
+
+================================================================================
+FILE: app/adapters/outbound/tavily_adapter.py
+================================================================================
+"""Адаптер для внешнего поискового API Tavily.
+
+Слой: Adapters (Outbound)
+Имплементирует: ISearchPort
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+import httpx
+
+from app.application.ports.search_port import ISearchPort
+
+logger = logging.getLogger(__name__)
+
+
+class TavilyAdapter(ISearchPort):
+    """Асинхронный адаптер Tavily Search API."""
+
+    def __init__(
+        self,
+        api_key: str,
+        http_client: httpx.AsyncClient | None = None,
+    ) -> None:
+        self._api_key: str = api_key
+        self._client: httpx.AsyncClient = http_client or httpx.AsyncClient(timeout=15.0)
+
+    async def search(self, query: str) -> list[dict[str, Any]]:
+        """Выполняет поиск через официальный Tavily REST API."""
+        if not self._api_key:
+            logger.debug("TAVILY_API_KEY не сконфигурирован. Пропуск.")
+            return []
+
+        endpoint = "https://api.tavily.com/search"
+        payload = {
+            "api_key": self._api_key,
+            "query": query,
+            "search_depth": "basic",
+            "max_results": 5,
+        }
+
+        try:
+            logger.debug("Отправка запроса в Tavily API: query=%.40s...", query)
+            response = await self._client.post(endpoint, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            results = data.get("results", [])
+
+            return [
+                {
+                    "title": item.get("title", ""),
+                    "url": item.get("url", ""),
+                    "content": item.get("content", ""),
+                }
+                for item in results
+                if isinstance(item, dict)
+            ]
+        except Exception as exc:
+            logger.warning("Сбой при выполнении запроса к Tavily API: %s", exc)
+            return []
+
+
+================================================================================
+FILE: app/adapters/outbound/composite_search_adapter.py
+================================================================================
+"""Композитный адаптер поиска с поддержкой Fallback.
+
+Слой: Adapters (Outbound)
+Имплементирует: ISearchPort
+Паттерн: Fallback / Chain of Responsibility
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from app.application.ports.search_port import ISearchPort
+
+logger = logging.getLogger(__name__)
+
+
+class CompositeSearchAdapter(ISearchPort):
+    """Комбинированный поиск: сначала SearXNG, при сбое или пустом ответе — Tavily."""
+
+    def __init__(
+        self,
+        primary_adapter: ISearchPort,
+        fallback_adapter: ISearchPort | None = None,
+    ) -> None:
+        self._primary: ISearchPort = primary_adapter
+        self._fallback: ISearchPort | None = fallback_adapter
+
+    async def search(self, query: str) -> list[dict[str, Any]]:
+        """Выполняет поиск с автоматическим переключением на резервный источник."""
+        try:
+            logger.debug("Попытка поиска через Primary Search Adapter (SearXNG)...")
+            results = await self._primary.search(query)
+            if results:
+                return results
+            logger.info("Primary Search Adapter вернул пустой список. Переключение на Fallback...")
+        except Exception as exc:
+            logger.warning("Ошибка Primary Search Adapter: %s. Переключение на Fallback...", exc)
+
+        if self._fallback is not None:
+            try:
+                logger.debug("Попытка поиска через Fallback Search Adapter (Tavily)...")
+                return await self._fallback.search(query)
+            except Exception as exc:
+                logger.warning("Ошибка Fallback Search Adapter: %s", exc)
+
+        return []
+
+
+================================================================================
+FILE: app/adapters/outbound/qdrant_adapter.py
+================================================================================
+"""Адаптер для взаимодействия с векторной базой данных Qdrant.
+
+Слой: Adapters (Outbound)
+Имплементирует: IVectorStorePort
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+import httpx
+
+from app.application.ports.vector_port import IVectorStorePort
+
+logger = logging.getLogger(__name__)
+
+
+class QdrantAdapter(IVectorStorePort):
+    """Асинхронный REST-адаптер для работы с Qdrant."""
+
+    def __init__(
+        self,
+        base_url: str = "http://qdrant:6333",
+        collection_name: str = "bot_context",
+        http_client: httpx.AsyncClient | None = None,
+    ) -> None:
+        self._base_url: str = base_url.rstrip("/")
+        self._collection: str = collection_name
+        self._client: httpx.AsyncClient = http_client or httpx.AsyncClient(timeout=10.0)
+
+    async def search_similar(self, query: str, limit: int = 3) -> list[dict[str, Any]]:
+        """Поиск похожих векторных записей по коллекции."""
+        endpoint = f"{self._base_url}/collections/{self._collection}/points/scroll"
+        payload = {
+            "limit": limit,
+            "with_payload": True,
+            "with_vector": False,
+        }
+
+        try:
+            response = await self._client.post(endpoint, json=payload)
+            if response.status_code == 404:
+                logger.debug("Коллекция '%s' пока не создана в Qdrant.", self._collection)
+                return []
+            response.raise_for_status()
+            data = response.json()
+            points = data.get("result", {}).get("points", [])
+
+            results: list[dict[str, Any]] = []
+            for pt in points:
+                payload_data = pt.get("payload", {})
+                if "text" in payload_data:
+                    results.append({
+                        "id": pt.get("id"),
+                        "text": payload_data["text"],
+                        "metadata": payload_data.get("metadata", {}),
+                    })
+            return results
+        except Exception as exc:
+            logger.warning("Сбой при обращении к Qdrant search_similar: %s", exc)
+            return []
+
+    async def save_context(self, text: str, metadata: dict[str, Any] | None = None) -> bool:
+        """Сохранение контекста в векторную БД."""
+        endpoint = f"{self._base_url}/collections/{self._collection}/points"
+        import uuid
+        point_id = str(uuid.uuid4())
+        # При отсутствии внешнего embedding-сервиса используем плейсхолдер 4D для инициализации
+        payload = {
+            "points": [
+                {
+                    "id": point_id,
+                    "vector": [0.1, 0.2, 0.3, 0.4],
+                    "payload": {
+                        "text": text,
+                        "metadata": metadata or {},
+                    },
+                }
+            ]
+        }
+
+        try:
+            response = await self._client.put(endpoint, json=payload)
+            return response.is_success
+        except Exception as exc:
+            logger.warning("Не удалось сохранить контекст в Qdrant: %s", exc)
+            return False
+
+
+================================================================================
+FILE: main.py
+================================================================================
+"""Composition Root (Точка входа приложения).
+
+Отвечает за:
+1. Загрузку конфигурации (pydantic-settings).
+2. Инициализацию асинхронных HTTP-клиентов и хранилищ.
+3. Инстанцирование исходящих адаптеров (HF, Bunker, SearXNG + Tavily Fallback, Qdrant).
+4. Внедрение зависимостей (DI) в Use Cases.
+5. Запуск Telegram бота через Aiogram 3.x Long Polling.
+6. Graceful Shutdown (закрытие bot.session и dp.storage).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import sys
+
+import httpx
+
+from app.adapters.inbound.telegram.bot import create_bot_and_dispatcher
+from app.adapters.outbound.bunker_adapter import BunkerAdapter
+from app.adapters.outbound.composite_search_adapter import CompositeSearchAdapter
+from app.adapters.outbound.hf_adapter import HfAdapter
+from app.adapters.outbound.qdrant_adapter import QdrantAdapter
+from app.adapters.outbound.searxng_adapter import SearxngAdapter
+from app.adapters.outbound.tavily_adapter import TavilyAdapter
+from app.application.use_cases.process_prompt import ProcessPromptUseCase
+from app.config import settings
+
+logging.basicConfig(
+    level=settings.LOG_LEVEL,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
+
+
+async def main() -> None:
+    """Основная асинхронная процедура запуска приложения."""
+    logger.info("Запуск Telegram-бота с гексагональной архитектурой...")
+
+    # Общий пул соединений httpx с настроенными лимитами
+    limits = httpx.Limits(max_keepalive_connections=20, max_connections=50)
+    timeout = httpx.Timeout(60.0, connect=10.0)
+
+    async with httpx.AsyncClient(limits=limits, timeout=timeout) as http_client:
+        # 1. Инициализация исходящих адаптеров (Outbound Adapters)
+        hf_adapter = HfAdapter(
+            api_key=settings.HF_API_KEY,
+            default_model=settings.HF_DEFAULT_MODEL,
+            http_client=http_client,
+            max_retries=3,
+        )
+
+        bunker_adapter = BunkerAdapter(
+            base_url=settings.BUNKER_API_URL,
+            token=settings.BUNKER_TOKEN,
+            http_client=http_client,
+        )
+
+        searxng_adapter = SearxngAdapter(
+            base_url=settings.SEARXNG_URL,
+            http_client=http_client,
+        )
+
+        tavily_adapter = TavilyAdapter(
+            api_key=settings.TAVILY_API_KEY,
+            http_client=http_client,
+        ) if settings.TAVILY_API_KEY else None
+
+        # Композитный поиск с автоматическим переключением на Tavily при сбое SearXNG
+        search_adapter = CompositeSearchAdapter(
+            primary_adapter=searxng_adapter,
+            fallback_adapter=tavily_adapter,
+        )
+
+        # Векторное хранилище Qdrant для семантического RAG
+        qdrant_adapter = QdrantAdapter(
+            base_url=settings.QDRANT_URL,
+            collection_name="bot_context",
+            http_client=http_client,
+        )
+
+        # 2. Инициализация слоя Use Cases с внедрением зависимостей (DI)
+        process_prompt_use_case = ProcessPromptUseCase(
+            hf_port=hf_adapter,
+            bunker_port=bunker_adapter,
+            search_port=search_adapter,
+            vector_port=qdrant_adapter,
+        )
+
+        # 3. Инициализация входящего адаптера (Telegram)
+        bot, dp = create_bot_and_dispatcher(
+            bot_token=settings.BOT_TOKEN,
+            process_prompt_use_case=process_prompt_use_case,
+            redis_url=settings.REDIS_URL,
+        )
+
+        # 4. Запуск Long Polling с контролем завершения ресурсов
+        logger.info("Бот успешно сконфигурирован. Запуск polling...")
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+            await dp.start_polling(bot)
+        finally:
+            logger.info("Корректное закрытие ресурсов (Graceful Shutdown)...")
+            try:
+                if hasattr(dp, "storage") and dp.storage:
+                    await dp.storage.close()
+                    logger.info("FSM Storage успешно закрыт.")
+            except Exception as exc:
+                logger.warning("Ошибка при закрытии FSM storage: %s", exc)
+
+            try:
+                await bot.session.close()
+                logger.info("Telegram Bot session закрыта.")
+            except Exception as exc:
+                logger.warning("Ошибка при закрытии bot.session: %s", exc)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот остановлен пользователем.")

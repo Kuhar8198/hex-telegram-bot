@@ -1,0 +1,6 @@
+{
+  "name": "Hexagonal Telegram Bot Engine",
+  "description": "Production-ready asynchronous hexagonal architecture implementation for Telegram AI Bot.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

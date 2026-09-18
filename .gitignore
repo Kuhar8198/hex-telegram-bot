@@ -1,0 +1,45 @@
+# Environments & Secrets
+.env*
+!.env.example
+*.pem
+*.key
+
+# Python & Caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Testing & Linters
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# Node / Web template artifacts
+node_modules/
+bun.lock
+
+# OS artifacts
+.DS_Store
+*.log

@@ -1,0 +1,36 @@
+# SearXNG configuration with JSON API enabled
+use_default_settings: true
+
+general:
+  debug: false
+  instance_name: "HexBot SearXNG"
+
+server:
+  port: 8080
+  bind_address: "0.0.0.0"
+  limiter: false
+  image_proxy: false
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "auto"
+  formats:
+    - html
+    - json
+
+engines:
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    disabled: false
+
+  - name: google
+    engine: google
+    shortcut: g
+    disabled: false
+
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: wp
+    disabled: false
