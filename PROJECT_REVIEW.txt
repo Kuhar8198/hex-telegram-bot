@@ -1,67 +1,81 @@
 ================================================================================
-HEXAGONAL TELEGRAM BOT — ПОЛНЫЙ СРЕЗ ПРОЕКТА ДЛЯ АУДИТА И РЕВЬЮ
-Дата: 2026-09-18
-Стек: Python 3.11+, Aiogram 3.x, httpx (async), Qdrant, Docker Compose
+HEXAGONAL TELEGRAM BOT — ПОЛНЫЙ СРЕЗ ПРОЕКТА ДЛЯ АУДИТА (ФИНИШ 5-ГО ЧАСА)
+Дата среза: 2026-09-18
+Стек: Python 3.11+, Aiogram 3.x, httpx (async), Qdrant (RAG), Redis (FSM), SearXNG, Tavily, Docker Compose
 Архитектура: Hexagonal Architecture (Ports and Adapters)
-Репозиторий GitHub: https://github.com/Kuhar8198/hex-telegram-bot
+GitHub: https://github.com/Kuhar8198/hex-telegram-bot
 ================================================================================
 
-АРХИТЕКТУРНЫЙ ЧЕКЛИСТ И АУДИТ:
-[+] СТРОГАЯ ИЗОЛЯЦИЯ СЛОЕВ:
-    - Domain (models.py): чистые DTO, нет внешних библиотек и I/O.
-    - Ports: только abc.ABC интерфейсы, отсутствие зависимостей от httpx/aiogram/qdrant.
-    - Use Case (process_prompt.py): зависимости передаются строго через DI в __init__.
-    - Adapters: конкретные реализации вынесены во внешние слои inbound/outbound.
-    - Composition Root (main.py): единственная точка связывания зависимостей.
+--------------------------------------------------------------------------------
+1. СТАТУС РЕАЛИЗАЦИИ И ЧЕК-ЛИСТ НА 5-Й ЧАС:
+--------------------------------------------------------------------------------
+[x] АРХИТЕКТУРА И ИЗОЛЯЦИЯ СЛОЕВ:
+    - app/domain/: DTO (UserPromptDTO, BotResponseDTO, SearchResultDTO) — чистый Python без I/O.
+    - app/application/ports/: Чистые ABC интерфейсы (IHuggingFacePort, IBunkerPort, ISearchPort, IVectorStorePort).
+    - app/application/use_cases/: Оркестрация (ProcessPromptUseCase) с внедрением зависимостей через __init__.
+    - app/adapters/inbound/telegram/: Aiogram 3.x Long Polling с роутерами и FSM Storage.
+    - app/adapters/outbound/: Конкретные клиенты (HfAdapter, BunkerAdapter, SearxngAdapter, TavilyAdapter, CompositeSearchAdapter, QdrantAdapter).
+    - main.py: Точка компоновки (Composition Root) и управление жизненным циклом ресурсов.
 
-[+] 100% АСИНХРОННОСТЬ:
-    - Все сетевые вызовы выполняются через асинхронный пул httpx.AsyncClient.
-    - Ни одного блокирующего вызова time.sleep() или синхронных библиотек.
+[x] 100% АСИНХРОННОСТЬ И ВЫСОКАЯ НАГРУЗКА:
+    - Единый пул httpx.AsyncClient(limits=Limits(max_keepalive_connections=20, max_connections=50)).
+    - Полное отсутствие блокирующих функций (time.sleep, requests, urrlib).
 
-[+] ОБРАБОТКА ОШИБОК И ЛИМИТОВ:
-    - Telegram: автоматический чанкинг сообщений до 4000 символов (нет ошибки 'message too long').
-    - Telegram: сырой текст LLM передается с parse_mode=None (нет падений от разметки Markdown).
-    - HF API: перехват 503 (Cold Start) с чтением estimated_time и паузой asyncio.sleep.
-    - HF API: Exponential Backoff (3 попытки с задержкой 2^n сек).
-    - Search: CompositeSearchAdapter (SearXNG с отказоустойчивым переключением на Tavily).
-    - RAG: Семантический поиск и сохранение контекста в векторную БД Qdrant.
-    - Graceful Shutdown: корректное закрытие FSM Storage и bot.session при остановке.
+[x] ОТКАЗОУСТОЙЧИВОСТЬ И ПАТТЕРНЫ НАДЁЖНОСТИ:
+    - Telegram: Умный чанкинг split_text_into_chunks() с порогом 4000 символов (нет лимита 4096).
+    - Telegram: Отправка сырого текста модели с parse_mode=None (защита от TelegramBadRequest).
+    - HF Inference: Обработка HTTP 503 (Cold Start) с чтением estimated_time и повтором.
+    - HF Inference: Экспоненциальный бэкофф (3 попытки с интервалом 2^n сек).
+    - Search: CompositeSearchAdapter с авто-переключением SearXNG -> Tavily при сбое или пустой выдаче.
+    - Vector Memory: IVectorStorePort + QdrantAdapter (поиск семантического контекста и асинхронное сохранение).
+    - Graceful Shutdown: Гарантированное закрытие dp.storage.close() и bot.session.close() в finally-блоке.
 
-================================================================================
-СТРУКТУРА ФАЙЛОВ
-================================================================================
+[x] ИНФРАСТРУКТУРА И ДЕПЛОЙ («КОЧЕВНИК»):
+    - Dockerfile: Multi-stage slim-образ на Python 3.11.
+    - docker-compose.yml: 5 сервисов (bot, searxng, qdrant, redis, watchtower).
+    - deploy.sh: Скрипт холодного развертывания.
+    - deploy/deploy.yml: CI/CD workflow для GitHub Actions и GHCR.
+    - Zero Hardcoded Secrets: Переменная SEARXNG_SECRET вынесена в env, ключи строго в .env.
+
+--------------------------------------------------------------------------------
+2. ДЕРЕВО КАТАЛОГОВ ПРОЕКТА:
+--------------------------------------------------------------------------------
 app/
-├── domain/models.py
+├── domain/
+│   └── models.py
 ├── application/
 │   ├── ports/
-│   │   ├── hf_port.py
 │   │   ├── bunker_port.py
+│   │   ├── hf_port.py
 │   │   ├── search_port.py
 │   │   └── vector_port.py
-│   └── use_cases/process_prompt.py
+│   └── use_cases/
+│       └── process_prompt.py
 ├── adapters/
 │   ├── inbound/telegram/
 │   │   ├── bot.py
 │   │   └── handlers.py
 │   └── outbound/
-│       ├── hf_adapter.py
 │       ├── bunker_adapter.py
-│       ├── searxng_adapter.py
-│       ├── tavily_adapter.py
 │       ├── composite_search_adapter.py
-│       └── qdrant_adapter.py
+│       ├── hf_adapter.py
+│       ├── qdrant_adapter.py
+│       ├── searxng_adapter.py
+│       └── tavily_adapter.py
 ├── config.py
 main.py
-Dockerfile
-docker-compose.yml
 deploy.sh
+docker-compose.yml
+Dockerfile
 requirements.txt
 README.md
-.github/workflows/deploy.yml
-searxng/settings.yml
+searxng/
+└── settings.yml
+deploy/
+└── deploy.yml
 
 ================================================================================
-ПОЛНЫЙ ИСХОДНЫЙ КОД ВСЕХ МОДУЛЕЙ
+3. ПОЛНЫЙ ИСХОДНЫЙ КОД ВСЕХ МОДУЛЕЙ (БЕЗ СОКРАЩЕНИЙ)
 ================================================================================
 
 
@@ -270,6 +284,56 @@ LOG_LEVEL=INFO
 
 
 ================================================================================
+FILE: .gitignore
+================================================================================
+# Environments & Secrets
+.env*
+!.env.example
+*.pem
+*.key
+
+# Python & Caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Testing & Linters
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# Node / Web template artifacts
+node_modules/
+bun.lock
+
+# OS artifacts
+.DS_Store
+*.log
+
+
+================================================================================
 FILE: Dockerfile
 ================================================================================
 # Multi-stage production build for Hexagonal Telegram Bot
@@ -431,6 +495,43 @@ echo "Бот и сопутствующие сервисы успешно зап�
 
 
 ================================================================================
+FILE: deploy/deploy.yml
+================================================================================
+name: Nomad Auto-Build & Deploy
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GH_PAT_TOKEN }}
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ghcr.io/${{ github.repository }}/bot:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+
+================================================================================
 FILE: searxng/settings.yml
 ================================================================================
 # SearXNG configuration with JSON API enabled
@@ -469,43 +570,6 @@ engines:
     engine: wikipedia
     shortcut: wp
     disabled: false
-
-
-================================================================================
-FILE: .github/workflows/deploy.yml
-================================================================================
-name: Nomad Auto-Build & Deploy
-
-on:
-  push:
-    branches: [ "main" ]
-
-jobs:
-  build-and-push:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GH_PAT_TOKEN }}
-
-      - name: Build and Push Docker Image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile
-          push: true
-          tags: ghcr.io/${{ github.repository }}/bot:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
 
 ================================================================================
